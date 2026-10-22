@@ -1,0 +1,1116 @@
+{
+  "repo": "wwongw21/voicebox",
+  "sha": "51f49dea198384b4eb6087b72c17057c6eb1c1cd",
+  "branch": "main",
+  "instructions": "No AGENTS.md found in checkout.",
+  "findings": [
+    {
+      "id": "VB-1",
+      "severity": "High",
+      "classification": "Confirmed",
+      "file": "backend/services/task_queue.py",
+      "lines": [
+        105,
+        110
+      ],
+      "title": "Cancelling an active generation releases the serial queue while inference continues in a thread",
+      "evidence": "cancel_generation calls running_task.cancel(). The worker awaits only the asyncio task (49-56), while backend/backends/pytorch_backend.py:243, mlx_backend.py:262 and other engines await asyncio.to_thread(_generate_sync). Cancelling that await does not stop an already-running thread. run_generation catches CancelledError and returns (generation.py:137-144), allowing the queue to launch the next job.",
+      "impact": "Cancelling a long running generation while another is queued causes overlapping inference on the same shared backend/model, defeating the stated GPU serialization guarantee. Extra GPU memory use, model contention and changed random seeds are credible consequences; actual GPU failure was not tested.",
+      "recommendation": "Keep exclusive inference ownership until the underlying thread completes, or implement cooperative model cancellation that confirms computation has stopped before advancing the queue. Apply the same ownership guard to unqueued synchronous/stream generation paths.",
+      "validation": "Reproduced with the real task_queue module and two jobs: first calls asyncio.to_thread on a blocking threading.Event, then is cancelled; second starts before the event is released. /workspace/review/voicebox_repro.py asserts this overlap. Existing cancellation tests use cancellable asyncio.Event waits and do not exercise threaded inference. Stronger independent challenge: /workspace/review/voicebox_production_cancellation_repro.py executes unchanged AST-extracted production run_generation and PyTorchTTSBackend.generate bodies plus the actual generate_chunked and task_queue modules, substituting a blocking model and DB/audio I/O only. It proves first generation writes failed and closes DB, and second generation completes, before the first model thread is released. Frontend reachability: HistoryTable.tsx:468-469 treats generating/loading_model as active; :624-631 offers Cancel generation button; :104-105 invokes apiClient.cancelGeneration; api/client.ts:267-270 posts the production cancel endpoint. No native GUI click was performed.",
+      "disposition": "Act on",
+      "source_sha": "51f49dea198384b4eb6087b72c17057c6eb1c1cd",
+      "source_url": "https://github.com/wwongw21/voicebox/blob/51f49dea198384b4eb6087b72c17057c6eb1c1cd/backend/services/task_queue.py#L105"
+    },
+    {
+      "id": "VB-2",
+      "severity": "Medium",
+      "classification": "Confirmed",
+      "file": "backend/config.py",
+      "lines": [
+        63,
+        74
+      ],
+      "title": "A custom data directory below an ancestor named data breaks saved audio paths",
+      "evidence": "to_storage_path searches the first path component named data (67-69) before attempting to relativize against the actual configured _data_dir. For _data_dir=/tmp/.../data/voicebox, a newly generated /tmp/.../data/voicebox/generations/example.wav becomes voicebox/generations/example.wav; resolve_storage_path then resolves it to /tmp/.../data/voicebox/voicebox/generations/example.wav.",
+      "impact": "Valid --data-dir configurations such as /mnt/data/voicebox cause generated audio, samples, captures and avatars to be written successfully but saved under paths that fail on retrieval. Audio endpoints return 404 and profiles cannot reload reference audio.",
+      "recommendation": "First make paths relative to the configured _data_dir. Limit legacy rebasing by a data-named ancestor to legacy reads/migration, after checking the real configured root.",
+      "validation": "Executed a stdlib-only round trip with config.set_data_dir(temp/data/voicebox), wrote a temporary generation file, and verified resolve_storage_path(to_storage_path(file)) != file. Reproduction is in /workspace/review/voicebox_repro.py.",
+      "disposition": "Act on",
+      "source_sha": "51f49dea198384b4eb6087b72c17057c6eb1c1cd",
+      "source_url": "https://github.com/wwongw21/voicebox/blob/51f49dea198384b4eb6087b72c17057c6eb1c1cd/backend/config.py#L63"
+    },
+    {
+      "id": "VB-3",
+      "severity": "Medium",
+      "classification": "Confirmed",
+      "file": "backend/models.py",
+      "lines": [
+        88,
+        88
+      ],
+      "title": "Omitting engine overrides the selected voice profile default with qwen",
+      "evidence": "GenerationRequest.engine is Optional but defaults to qwen. routes/generations.py:54-55 resolves data.engine or profile.default_engine or profile.preset_engine, so the profile fallbacks are unreachable for an omitted engine. For a Kokoro preset, validate_profile_engine rejects the unintended qwen value (services/profiles.py:124-134). Both /generate and /generate/stream use this resolver.",
+      "impact": "API clients sending the documented minimal profile_id/text request cannot use Kokoro or Qwen CustomVoice preset profiles without explicitly supplying engine or null. A cloned profile with a different default engine also uses qwen silently, potentially loading the wrong model.",
+      "recommendation": "Default GenerationRequest.engine to None, retaining qwen as the final fallback in the route resolver. Test requests omitting engine for both preset and cloned profiles with a configured default.",
+      "validation": "Instantiated the actual GenerationRequest with no engine and confirmed engine == qwen; applying the route resolver expression to a kokoro default resolves qwen. No inference was needed. Reproduction is in /workspace/review/voicebox_repro.py.",
+      "disposition": "Act on",
+      "source_sha": "51f49dea198384b4eb6087b72c17057c6eb1c1cd",
+      "source_url": "https://github.com/wwongw21/voicebox/blob/51f49dea198384b4eb6087b72c17057c6eb1c1cd/backend/models.py#L88"
+    },
+    {
+      "id": "VB-4",
+      "severity": "Medium",
+      "classification": "Confirmed",
+      "file": "backend/routes/generations.py",
+      "lines": [
+        382,
+        388
+      ],
+      "title": "Stream generation silently discards the voice profile effects chain",
+      "evidence": "stream_speech gets profile from services.profiles.get_profile, which returns _profile_to_response (profiles.py:277). That converts stored effects JSON into List[EffectConfig] (profiles.py:35-42; models.py:39). The stream fallback calls json.loads(profile.effects_chain), catches the resulting TypeError, and sets effects_chain_config=None.",
+      "impact": "POST /generate/stream without an explicit request effects_chain always ignores enabled profile default effects, while persisted /generate correctly loads effects from the database JSON. Streaming audio does not match the configured voice.",
+      "recommendation": "Use [effect.model_dump() for effect in profile.effects_chain] for the already-deserialized response, or share effects resolution with the persisted generation flow.",
+      "validation": "Constructed an actual VoiceProfileResponse with enabled reverb EffectConfig and verified the exact json.loads operation raises TypeError because the value is a list. The route catches this and skips apply_effects. Reproduction is in /workspace/review/voicebox_repro.py.",
+      "disposition": "Act on",
+      "source_sha": "51f49dea198384b4eb6087b72c17057c6eb1c1cd",
+      "source_url": "https://github.com/wwongw21/voicebox/blob/51f49dea198384b4eb6087b72c17057c6eb1c1cd/backend/routes/generations.py#L382"
+    }
+  ],
+  "coverage": [
+    "Backend app factory, CORS and lifespan setup, route registration and main/server startup contracts",
+    "Generation orchestration, task cancellation, PyTorch/MLX inference thread boundaries and streaming route",
+    "Profile CRUD and validation, ZIP import/export paths, storage path conversion and file serving",
+    "History/version persistence, story joins and editing interfaces, model cache migration/delete paths",
+    "Desktop permissions/configuration, frontend API request defaults, package/dependency manifests, Docker bindings and CI/release workflows"
+  ],
+  "noted": [
+    "CI is configured to typecheck app/web and build web, but does not run the backend regression suite.",
+    "GitHub workflow execution was not verified by this reviewer; root reports the fork currently has no workflow runs.",
+    "The selected HFProgressTracker failure is a stale 1000-byte fixture inconsistent with the intentional 1MB reporting threshold. Reproduced with both current and older dependency versions; not counted as another runtime finding."
+  ],
+  "tests": [
+    {
+      "command": "PYTHONPATH=/workspace/repos/voicebox python /workspace/review/voicebox_repro.py",
+      "result": "Passed all four bug-mechanism assertions; uses temporary storage files and simulated threaded inference only."
+    },
+    {
+      "command": "AST parse all backend/**/*.py with Python 3.12",
+      "result": "120 files parsed, 0 syntax errors."
+    },
+    {
+      "command": "PYTHONPATH=/workspace/repos/voicebox/backend:/workspace/repos/voicebox uv run --no-project --with pytest --with pytest-asyncio --with sqlalchemy --with fastapi --with httpx --with tqdm --with huggingface-hub python -m pytest backend/tests/test_task_queue_cancellation.py backend/tests/test_audio_failed_generation.py backend/tests/test_cors.py backend/tests/test_progress.py -q --disable-warnings",
+      "result": "33 passed, 1 failed in 4.03s. test_progress.py::test_hf_progress_tracker observed 0 progress callbacks instead of >0. Environment uses current lightweight dependencies meeting lower-bound specs, not the full release dependency environment."
+    },
+    {
+      "command": "Initial selected test collection including test_client_id_middleware.py",
+      "result": "Collection incomplete because fastmcp was not installed. This test was excluded from the later lightweight run; no claim of passing it."
+    },
+    {
+      "command": "PYTHONPATH=/workspace/repos/voicebox python /workspace/review/voicebox_production_cancellation_repro.py",
+      "result": "Passed: unchanged production orchestration, chunking and PyTorch async generate methods returned from cancelled first generation, persisted failed via fake DB, and started/completed second generation before first model thread completed. Torch inference is substituted with a blocking FakeModel; the async production function bodies are unchanged."
+    },
+    {
+      "command": "Isolated backend/tests/test_progress.py::test_hf_progress_tracker under both huggingface-hub 2.2.0 + tqdm 4.70.1 and huggingface-hub 0.36.0 + tqdm 4.67.3",
+      "result": "Fails identically in both environments. Diagnosed stale test fixture: test_progress.py:142 total_size=1000, but hf_progress.py:145-150 intentionally skips callbacks below 1,000,000 bytes; actual tracker gives 0 callbacks for 1000-byte total and 1 for 2,000,000-byte total. This is an inconsistent existing regression test, not evidence of broken large-file progress tracking or a dependency-version regression."
+    }
+  ],
+  "limitations": [
+    "No full TTS/STT model weights, Torch installation or GPU runtime used; concurrency reproduction proves overlap of threads, not actual GPU exhaustion.",
+    "No Tauri desktop/native audio capture or packaging run on this Linux review host; no Bun or Rust compilation executed.",
+    "No dependency CVE/advisory scan; manifests and integration contracts were inspected statically.",
+    "Findings are repository source review, not full formal security audit; API auth/CORS was inspected but no browser exploit was run.",
+    "Repository source unmodified; review scripts live outside the checkout.",
+    "Follow-up cancellation validation executes source-extracted unchanged production async function bodies and real queue/chunker with fake model and DB/audio dependencies; does not establish actual GPU crash severity. The default UI source exposes active cancellation, but no desktop/browser click test was run."
+  ],
+  "name": "voicebox",
+  "evidence_file": "report.json",
+  "ci_observation": {
+    "repo": "voicebox",
+    "total_count": 0,
+    "runs": []
+  },
+  "inventory": {
+    "repo": "voicebox",
+    "sha": "51f49dea198384b4eb6087b72c17057c6eb1c1cd",
+    "files": 681,
+    "source_exts": [
+      [
+        ".tsx",
+        147
+      ],
+      [
+        ".py",
+        123
+      ],
+      [
+        ".ts",
+        116
+      ],
+      [
+        ".png",
+        66
+      ],
+      [
+        ".mdx",
+        56
+      ],
+      [
+        ".json",
+        46
+      ],
+      [
+        ".md",
+        26
+      ]
+    ],
+    "tests": 35,
+    "ci": [
+      ".github/workflows/build-windows.yml",
+      ".github/workflows/ci.yml",
+      ".github/workflows/release.yml"
+    ]
+  },
+  "handoff": {
+    "repository": "wwongw21/voicebox",
+    "repo": "wwongw21/voicebox",
+    "branch": "main",
+    "sha": "51f49dea198384b4eb6087b72c17057c6eb1c1cd",
+    "local_checkout": "/workspace/repos/voicebox",
+    "handoff_type": "Implementation-ready review handoff; proposed repairs only",
+    "status": "OPEN — no code fixes authorized or implemented",
+    "audience": [
+      "Backend engineer implementing repairs",
+      "Desktop/API engineer checking contract compatibility",
+      "Release owner validating model and packaging behavior"
+    ],
+    "desired_outcome": "Preserve serial model execution during cancellation, round-trip audio paths under supported custom storage roots, honor profile engine defaults, and make streaming audio honor default effects. Close findings only after maintained regressions and relevant runtime checks pass.",
+    "scope_and_authority": {
+      "reviewed": [
+        "Backend app factory, CORS and lifespan setup, route registration and main/server startup contracts",
+        "Generation orchestration, task cancellation, PyTorch/MLX inference thread boundaries and streaming route",
+        "Profile CRUD and validation, ZIP import/export paths, storage path conversion and file serving",
+        "History/version persistence, story joins and editing interfaces, model cache migration/delete paths",
+        "Desktop permissions/configuration, frontend API request defaults, package/dependency manifests, Docker bindings and CI/release workflows"
+      ],
+      "instructions": "No AGENTS.md found in checkout.",
+      "performed": "Source inspection and safe local validation. Review artifacts were written outside the checkout. No repository source, Git history, remote settings, issues or release artifacts were modified.",
+      "implementation_authorization": "Not granted. Everything below is a handoff proposal, not an applied repair.",
+      "evidence_base": [
+        "voicebox.json",
+        "voicebox_repro.py",
+        "voicebox_production_cancellation_repro.py"
+      ],
+      "confidence_limits": [
+        "No full TTS/STT model weights, Torch installation or GPU runtime used; concurrency reproduction proves overlap of threads, not actual GPU exhaustion.",
+        "No Tauri desktop/native audio capture or packaging run on this Linux review host; no Bun or Rust compilation executed.",
+        "No dependency CVE/advisory scan; manifests and integration contracts were inspected statically.",
+        "Findings are repository source review, not full formal security audit; API auth/CORS was inspected but no browser exploit was run.",
+        "Repository source unmodified; review scripts live outside the checkout.",
+        "Follow-up cancellation validation executes source-extracted unchanged production async function bodies and real queue/chunker with fake model and DB/audio dependencies; does not establish actual GPU crash severity. The default UI source exposes active cancellation, but no desktop/browser click test was run."
+      ],
+      "finding_count": 4,
+      "severity_counts": {
+        "High": 1,
+        "Medium": 3
+      }
+    },
+    "architecture": {
+      "product": "Local voice cloning, speech synthesis, dictation and audio editing application, available through a shared React frontend, a Tauri desktop shell, and a standalone FastAPI server.",
+      "components": [
+        {
+          "name": "Shared UI and API client",
+          "paths": [
+            "app/src/components/Generation",
+            "app/src/components/History/HistoryTable.tsx",
+            "app/src/lib/api/client.ts",
+            "app/src/lib/api/types.ts",
+            "web"
+          ],
+          "responsibility": "Profile selection, synthesis requests, history rendering, cancellation requests, and browser frontend distribution."
+        },
+        {
+          "name": "Desktop host",
+          "paths": [
+            "tauri/src-tauri",
+            "tauri/src-tauri/capabilities/default.json",
+            "backend/server.py"
+          ],
+          "responsibility": "Native capture/playback and desktop integration; backend sidecar startup and parent-process watchdog. Desktop execution was not tested."
+        },
+        {
+          "name": "HTTP app and request contracts",
+          "paths": [
+            "backend/app.py",
+            "backend/main.py",
+            "backend/models.py",
+            "backend/routes"
+          ],
+          "responsibility": "FastAPI app lifecycle, CORS, routing, Pydantic request/response parsing, SSE/audio responses, and mounted MCP interface."
+        },
+        {
+          "name": "Generation orchestration and queue",
+          "paths": [
+            "backend/services/task_queue.py",
+            "backend/services/generation.py",
+            "backend/utils/chunked_tts.py",
+            "backend/utils/tasks.py"
+          ],
+          "responsibility": "Serial queued inference, status transitions, cancellation, chunked synthesis, audio persistence and task tracking. Direct streaming and nonpersisted generation also reach the backend outside this queue."
+        },
+        {
+          "name": "Model adapters",
+          "paths": [
+            "backend/backends/__init__.py",
+            "backend/backends/pytorch_backend.py",
+            "backend/backends/mlx_backend.py",
+            "backend/backends/*_backend.py"
+          ],
+          "responsibility": "Select/load engines and bridge blocking model APIs into async handlers through asyncio.to_thread. Cancellation ownership must match actual thread lifetime."
+        },
+        {
+          "name": "Persistence and audio effects",
+          "paths": [
+            "backend/config.py",
+            "backend/database",
+            "backend/services/profiles.py",
+            "backend/services/history.py",
+            "backend/services/versions.py",
+            "backend/utils/effects.py",
+            "backend/routes/audio.py"
+          ],
+          "responsibility": "SQLite records, configured data root, relative paths, profile effects conversion, version files and audio serving."
+        },
+        {
+          "name": "Verification and distribution",
+          "paths": [
+            "backend/tests",
+            "backend/requirements.txt",
+            "package.json",
+            "bun.lock",
+            ".github/workflows/ci.yml",
+            ".github/workflows/release.yml",
+            "Dockerfile"
+          ],
+          "responsibility": "Backend regression scripts, dependency declarations, frontend build gates and desktop packaging. Current CI file only typechecks and builds the frontend."
+        }
+      ],
+      "critical_flows": [
+        "History active row -> Cancel generation button -> apiClient.cancelGeneration -> POST /generate/{id}/cancel -> task_queue.cancel_generation -> Task.cancel -> run_generation CancelledError cleanup. The model thread continues unless explicitly joined/cooperatively stopped.",
+        "POST /generate -> Pydantic GenerationRequest -> profile response -> engine resolver/validator -> queue -> run_generation -> generate_chunked -> engine.generate -> asyncio.to_thread -> save version/audio -> generation terminal status.",
+        "Written audio path -> config.to_storage_path -> SQLite audio_path -> config.resolve_storage_path -> audio route is_file guard -> FileResponse.",
+        "POST /generate/stream -> get_profile returns parsed EffectConfig list -> generation -> request/profile effects resolution -> apply_effects -> optional normalization -> WAV response."
+      ]
+    },
+    "immediate_mitigations": [
+      {
+        "finding": "VB-1",
+        "action": "Let active model inference finish; cancel only queued work while this defect remains open. After an active cancellation has already occurred, do not submit/retry more generation merely because its row is failed; wait for actual model activity to finish, or fully stop and restart the backend before resuming.",
+        "limits": "This is an operational workaround, not a code guarantee. Failed UI status does not prove its thread has stopped. Restarting interrupts other clients and queued work. No new configuration flag or safe immediate thread-stop API was found or used."
+      },
+      {
+        "finding": "VB-2",
+        "action": "For fresh isolated deployments choose a data root without an earlier ancestor component literally named data, such as /srv/voicebox-store. Before changing any existing deployment location, make a consistent backup of SQLite and the complete data directory and inventory current stored paths.",
+        "limits": "Changing the root does not repair already-malformed rows. Do not bulk rename/move/delete existing audio or rewrite database paths without a verified mapping and backup. The normal final data directory named data works when no earlier ancestor named data takes precedence."
+      },
+      {
+        "finding": "VB-3",
+        "action": "API callers can explicitly supply the engine matching the profile, or explicitly send engine: null to activate the current resolver fallback.",
+        "limits": "Every caller must apply this workaround. Omission still selects qwen until the request default changes. Explicit engine/profile mismatches should continue to be rejected."
+      },
+      {
+        "finding": "VB-4",
+        "action": "Send the intended effects_chain explicitly in streaming requests, or use the persisted /generate flow when profile default effects are required.",
+        "limits": "Callers must keep the explicit chain synchronized with profile settings. An empty list intentionally disables effects; null or omission currently reaches the broken default fallback. No inference was performed to compare audio perceptually."
+      }
+    ],
+    "implementation_sequence": [
+      {
+        "order": 0,
+        "work": "Preserve evidence and establish a clean repair baseline",
+        "depends_on": [],
+        "steps": [
+          "Start from the pinned SHA or explicitly record any newer baseline and revalidate affected evidence.",
+          "Create an isolated implementation branch/check-out after fixes are authorized; retain these review artifacts.",
+          "Prepare a consistent data/SQLite backup before exercising any path migration against real user data. Use disposable profiles, generated audio and model fixtures for tests."
+        ],
+        "completion_gate": "Baseline identified, backups planned/tested on disposable data, and regressions describe expected repaired behavior."
+      },
+      {
+        "order": 1,
+        "work": "Repair actual inference lifetime ownership for VB-1",
+        "depends_on": [
+          0
+        ],
+        "steps": [
+          "Add cancellation regression using a blocked model thread, not only asyncio.Event waits.",
+          "Retain thread completion ownership across cancellation in the backend inference boundary; keep the queue/resource lease held until the computation ends.",
+          "Audit equivalent async-to-thread adapter call sites and direct generation routes for the same ownership contract."
+        ],
+        "completion_gate": "No second model call can begin while cancelled first inference still owns the resource; cancellation remains responsive as a request acknowledgement."
+      },
+      {
+        "order": 2,
+        "work": "Repair path serialization and safe legacy handling for VB-2",
+        "depends_on": [
+          0
+        ],
+        "parallelism": "Can proceed independently of VB-1; use a separate change unit and coordinate any shared verification files.",
+        "steps": [
+          "Prioritize the configured data root when serializing current paths.",
+          "Preserve established empty-path and legacy-read behavior with explicit tests.",
+          "Decide whether existing malformed rows need a separate reversible recovery tool after inspecting real examples; do not silently infer path ownership."
+        ],
+        "completion_gate": "New records round-trip across the data-root matrix and legacy records remain readable without ambiguous remapping."
+      },
+      {
+        "order": 3,
+        "work": "Repair request defaults and stream effects for VB-3/VB-4",
+        "depends_on": [
+          0
+        ],
+        "parallelism": "Both touch generation request contracts/routes; coordinate as adjacent commits to avoid conflicting API tests.",
+        "steps": [
+          "Make omitted engine resolve through profile metadata, retaining explicit engine precedence.",
+          "Serialize the already-parsed profile EffectConfig list directly for streaming effects.",
+          "Exercise both persisted and streamed endpoints through mocked backend/model seams."
+        ],
+        "completion_gate": "Profile engine/effects defaults are consistent across endpoints, with explicit request overrides unchanged."
+      },
+      {
+        "order": 4,
+        "work": "Repair verification debt and add lightweight backend gates",
+        "depends_on": [
+          1,
+          2,
+          3
+        ],
+        "steps": [
+          "Align the progress tracker test fixture with the intentional byte threshold and cover the below-threshold behavior separately.",
+          "Keep model/GPU-dependent tests outside a lightweight deterministic backend regression lane.",
+          "After implementation authorization, extend CI with the required backend regression lane and use the actual supported dependency set."
+        ],
+        "completion_gate": "New maintained regressions pass; the pre-existing progress test inconsistency is resolved; no passing result is claimed for unrun model tests."
+      },
+      {
+        "order": 5,
+        "work": "Run release validation and stage rollout",
+        "depends_on": [
+          4
+        ],
+        "steps": [
+          "Perform the NOT RUN release checks listed below on supported platforms.",
+          "Stage the corrected backend with disposable data first, then a backed-up user data copy.",
+          "Monitor cancellation queue depth, resource activity, audio 404s and engine/effects mismatch reports."
+        ],
+        "completion_gate": "All relevant release checks pass with documented versions/results; rollback can restore application code and any deliberately changed path records without discarding later unrelated user writes."
+      }
+    ],
+    "findings": [
+      {
+        "id": "VB-1",
+        "status": "OPEN",
+        "severity": "High",
+        "classification": "Confirmed",
+        "title": "Cancelling an active generation releases the serial queue while inference continues in a thread",
+        "evidence": "cancel_generation calls running_task.cancel(). The worker awaits only the asyncio task (49-56), while backend/backends/pytorch_backend.py:243, mlx_backend.py:262 and other engines await asyncio.to_thread(_generate_sync). Cancelling that await does not stop an already-running thread. run_generation catches CancelledError and returns (generation.py:137-144), allowing the queue to launch the next job.",
+        "impact": "Cancelling a long running generation while another is queued causes overlapping inference on the same shared backend/model, defeating the stated GPU serialization guarantee. Extra GPU memory use, model contention and changed random seeds are credible consequences; actual GPU failure was not tested.",
+        "validation_already_performed": "Reproduced with the real task_queue module and two jobs: first calls asyncio.to_thread on a blocking threading.Event, then is cancelled; second starts before the event is released. /workspace/review/voicebox_repro.py asserts this overlap. Existing cancellation tests use cancellable asyncio.Event waits and do not exercise threaded inference. Stronger independent challenge: /workspace/review/voicebox_production_cancellation_repro.py executes unchanged AST-extracted production run_generation and PyTorchTTSBackend.generate bodies plus the actual generate_chunked and task_queue modules, substituting a blocking model and DB/audio I/O only. It proves first generation writes failed and closes DB, and second generation completes, before the first model thread is released. Frontend reachability: HistoryTable.tsx:468-469 treats generating/loading_model as active; :624-631 offers Cancel generation button; :104-105 invokes apiClient.cancelGeneration; api/client.ts:267-270 posts the production cancel endpoint. No native GUI click was performed.",
+        "affected_workflows": [
+          "Active Cancel generation action in desktop/web History",
+          "Queued retry/regenerate after cancelling an in-flight model call",
+          "Backend engine adapters that offload model work into threads"
+        ],
+        "change_surface": [
+          {
+            "file": "backend/services/task_queue.py",
+            "lines": [
+              39,
+              66,
+              105,
+              110
+            ],
+            "purpose": "Queue ownership, cancellation request and worker progression"
+          },
+          {
+            "file": "backend/services/generation.py",
+            "lines": [
+              51,
+              94,
+              137,
+              158
+            ],
+            "purpose": "Await model operation, terminal cancellation handling and resource/session cleanup"
+          },
+          {
+            "file": "backend/backends/pytorch_backend.py",
+            "lines": [
+              202,
+              243
+            ],
+            "purpose": "Qwen PyTorch model inference runs in asyncio.to_thread"
+          },
+          {
+            "file": "backend/backends/mlx_backend.py",
+            "lines": [
+              169,
+              262
+            ],
+            "purpose": "Equivalent MLX threaded inference boundary"
+          },
+          {
+            "file": "backend/backends/chatterbox_backend.py",
+            "lines": [
+              167,
+              226
+            ],
+            "purpose": "Equivalent Chatterbox inference boundary"
+          },
+          {
+            "file": "backend/backends/chatterbox_turbo_backend.py",
+            "lines": [
+              149,
+              206
+            ],
+            "purpose": "Equivalent Chatterbox Turbo inference boundary"
+          },
+          {
+            "file": "backend/backends/kokoro_backend.py",
+            "lines": [
+              242,
+              293
+            ],
+            "purpose": "Equivalent Kokoro inference boundary"
+          },
+          {
+            "file": "backend/backends/luxtts_backend.py",
+            "lines": [
+              143,
+              184
+            ],
+            "purpose": "Equivalent LuxTTS inference boundary"
+          },
+          {
+            "file": "backend/backends/hume_backend.py",
+            "lines": [
+              287,
+              358
+            ],
+            "purpose": "Equivalent TADA inference boundary"
+          },
+          {
+            "file": "backend/backends/qwen_custom_voice_backend.py",
+            "lines": [
+              162,
+              213
+            ],
+            "purpose": "Equivalent CustomVoice inference boundary"
+          },
+          {
+            "file": "backend/routes/generations.py",
+            "lines": [
+              236,
+              280,
+              318,
+              377
+            ],
+            "purpose": "HTTP cancellation and direct stream generation entry points"
+          },
+          {
+            "file": "app/src/components/History/HistoryTable.tsx",
+            "lines": [
+              104,
+              105,
+              468,
+              469,
+              624,
+              631
+            ],
+            "purpose": "Default UI offers cancellation while loading/generating"
+          },
+          {
+            "file": "backend/tests/test_task_queue_cancellation.py",
+            "lines": [
+              1,
+              57
+            ],
+            "purpose": "Existing tests only exercise cancellable asyncio waits"
+          }
+        ],
+        "recommended_implementation": "Retain and join actual threaded model work when the async request is cancelled. Keep the generation queue/resource owner occupied until computation has terminated. Use cooperative engine stopping only where its completion can be proved; otherwise allow the current call to finish before propagating cancellation.",
+        "repair_steps": [
+          "Introduce a maintained fake-model regression that blocks inside the synchronous inference function. Queue a second real generation coroutine, cancel the first, and assert the second model call has not started until the blocked first model finishes.",
+          "At each supported inference adapter boundary, retain a handle to the offloaded task and prevent cancellation of the await from losing ownership of the running thread. Defer CancelledError propagation until the thread operation is joined or a cooperative engine stop has actually completed.",
+          "Make cancellation cleanup robust against repeated cancel requests and shutdown cancellation. A second Task.cancel must not bypass the join/resource lease.",
+          "Keep the existing immediate endpoint acknowledgement semantics if desired: Generation cancellation requested can return while cleanup waits. Only terminalize/advance the generation worker after the resource is no longer executing.",
+          "Do not treat awaiting an already-cancelled asyncio task as a thread join. The worker currently sees completion while the detached thread still runs.",
+          "Audit threaded model loading/voice-prompt creation and direct stream/nonpersisted generation for resource ownership using the same approach. Limit any broader serialization change to a documented contract rather than silently relying on the queued path to cover unqueued work.",
+          "Retain existing queued-cancel behavior: skip and close a not-yet-started coroutine, clear task tracking, and leave the worker usable."
+        ],
+        "invariants": [
+          "Cancelling the Python await must not allow a second call to use a shared model/GPU resource while the first synchronous call still owns it.",
+          "Every queued job is accounted for exactly once; task_done, tracked generation IDs and task-manager completion remain consistent.",
+          "Cancelled generations never persist completed audio after they are declared terminally failed.",
+          "Queue progression, model unload and shutdown must respect actual computation lifetime, not merely asyncio Task.done().",
+          "Cancellation must not deadlock on exceptions raised by the model or status persistence."
+        ],
+        "acceptance_criteria": [
+          "The blocked-thread test shows no overlap and no second model entry until first computation exits, after one or multiple cancellation requests.",
+          "The real run_generation cleanup does not record terminal cancellation/release ownership ahead of the selected cancellation contract.",
+          "Queued cancellation still prevents model execution and later jobs run successfully.",
+          "Model exception during cancellation and status-write failure leave no indefinitely occupied worker/resource lease.",
+          "On at least one supported GPU backend, cancelling an active job and immediately queuing another produces no overlapping model calls or unbounded extra GPU memory attributable to overlap."
+        ],
+        "regression_cases": [
+          "Cancel before worker starts; cancel during model load; cancel during reference prompt creation; cancel during short and multi-chunk generation.",
+          "Cancel twice during a blocked inference; cancel again during cancellation cleanup.",
+          "First model raises after cancellation; DB terminal-status write raises; shutdown occurs during inference.",
+          "Queue another job and retry the cancelled row; ensure jobs execute serially and IDs/task counts do not leak.",
+          "Exercise PyTorch and MLX boundary behavior with deterministic fakes; smoke-test other adapters using the same helper/contract.",
+          "Confirm direct /generate/stream and nonpersisted speak calls cannot invalidate the promised resource ownership policy."
+        ],
+        "compatibility_risks": [
+          "Without cooperative engine stopping, visible cancellation may remain pending until a long noninterruptible model call returns. This delay is intentional if required to preserve exclusive ownership.",
+          "New locking must cover the real model resource and avoid acquiring locks in conflicting order during model load/unload.",
+          "Thread joining during shutdown may extend exit time; process watchdog and desktop sidecar lifecycle require explicit validation.",
+          "A new cancelling status would affect frontend/MCP consumers and database conventions; preserve existing statuses unless a coordinated contract change is needed."
+        ],
+        "rollback": {
+          "code": "Revert the inference ownership patch and its dependent UI/status changes together. No schema migration is required for the recommended minimal approach.",
+          "operational_fallback": "Return to the active-cancel avoidance workaround. A code rollback restores the original overlap risk; do not label the defect closed.",
+          "data": "Use disposable data for cancellation experiments. No production data rewrite is part of this repair."
+        }
+      },
+      {
+        "id": "VB-2",
+        "status": "OPEN",
+        "severity": "Medium",
+        "classification": "Confirmed",
+        "title": "A custom data directory below an ancestor named data breaks saved audio paths",
+        "evidence": "to_storage_path searches the first path component named data (67-69) before attempting to relativize against the actual configured _data_dir. For _data_dir=/tmp/.../data/voicebox, a newly generated /tmp/.../data/voicebox/generations/example.wav becomes voicebox/generations/example.wav; resolve_storage_path then resolves it to /tmp/.../data/voicebox/voicebox/generations/example.wav.",
+        "impact": "Valid --data-dir configurations such as /mnt/data/voicebox cause generated audio, samples, captures and avatars to be written successfully but saved under paths that fail on retrieval. Audio endpoints return 404 and profiles cannot reload reference audio.",
+        "validation_already_performed": "Executed a stdlib-only round trip with config.set_data_dir(temp/data/voicebox), wrote a temporary generation file, and verified resolve_storage_path(to_storage_path(file)) != file. Reproduction is in /workspace/review/voicebox_repro.py.",
+        "affected_workflows": [
+          "Saving/retrieving generated audio and versions",
+          "Saving/loading profile samples and avatars",
+          "Capture audio and custom --data-dir deployments"
+        ],
+        "change_surface": [
+          {
+            "file": "backend/config.py",
+            "lines": [
+              25,
+              35,
+              63,
+              105
+            ],
+            "purpose": "Current path serialization, legacy data-directory detection and read resolution"
+          },
+          {
+            "file": "backend/services/generation.py",
+            "lines": [
+              191,
+              233,
+              247,
+              249
+            ],
+            "purpose": "Generated audio and version persistence use to_storage_path"
+          },
+          {
+            "file": "backend/services/profiles.py",
+            "lines": [
+              1,
+              25
+            ],
+            "purpose": "Profile sample/avatar persistence depends on config helpers; inspect individual call sites before editing"
+          },
+          {
+            "file": "backend/routes/audio.py",
+            "lines": [
+              25,
+              83
+            ],
+            "purpose": "Stored-path resolution and is_file/404 guards"
+          },
+          {
+            "file": "backend/tests/test_audio_failed_generation.py",
+            "lines": [
+              1,
+              166
+            ],
+            "purpose": "Existing empty-path/directory response regressions"
+          },
+          {
+            "file": "backend/database/migrations.py",
+            "lines": [
+              1
+            ],
+            "purpose": "Only needed if an explicit reversible legacy-row recovery is approved"
+          }
+        ],
+        "recommended_implementation": "Serialize current files relative to the actual configured root before considering any legacy heuristic. Keep legacy read compatibility separate and bounded; do not rewrite existing paths merely because their text contains data.",
+        "repair_steps": [
+          "Add a matrix of config round-trip tests for the default root, a custom root with no data component, a root below an earlier data ancestor, and repeated data components.",
+          "In to_storage_path, prioritize resolved_path.relative_to(_data_dir) for current in-root files. Retain an explicit documented fallback for any intentionally supported external absolute paths.",
+          "Review resolve_storage_path absolute handling so an existing path under the actual configured root is not mistaken for a legacy path based on an earlier data component.",
+          "Keep support for known 0.3.0 relative data/profiles/... rows and supported historical absolute data paths using tested read rules. Reject ambiguity rather than silently selecting a different existing audio file.",
+          "Inventory actual malformed persisted rows before proposing recovery. Where a unique existing target can be proven, plan an idempotent mapping with old/new values recorded and a dry-run mode; preserve all audio files.",
+          "Run endpoint-level file retrieval tests on a temporary SQLite database after path serialization. Confirm file existence, not just string equality."
+        ],
+        "invariants": [
+          "For a supported in-root file p, resolve_storage_path(to_storage_path(p)) resolves to p regardless of an ancestor named data.",
+          "New in-root DB paths are portable relative paths; moving the complete data root preserves references.",
+          "None and empty paths remain None; failed generations and directory-valued paths continue returning 404.",
+          "Legacy normalization must not overwrite audio, delete files, escape into an unintended storage root, or select a different file based only on a matching basename.",
+          "Repairing new writes alone must not be presented as having recovered every existing malformed row."
+        ],
+        "acceptance_criteria": [
+          "All configured-root matrix cases round-trip and their audio endpoints serve the actual newly written file.",
+          "Existing empty/null and directory-path tests continue passing.",
+          "Representative known legacy relative and absolute records remain readable after the root moves.",
+          "Any approved row-recovery operation is dry-runnable, idempotent, fully logged and reversible without modifying audio bytes."
+        ],
+        "regression_cases": [
+          "/srv/voicebox-store, /srv/data/voicebox, /srv/data/data/voicebox, default project/data, and a root with symlinked ancestors after resolve().",
+          "Generated original/processed/alternate versions, profile sample, avatar and capture rows use the same correct storage helper contract.",
+          "None, empty string, Path(\"\") and a stored directory remain non-file cases.",
+          "Legacy data/profiles/id/sample.wav; known previous absolute root; an external absolute file if the existing contract intentionally permits it.",
+          "Both a legacy rebase candidate and an original absolute file exist: do not silently serve the wrong one.",
+          "Windows native path semantics and drive changes need platform-specific tests rather than assuming POSIX Path represents Windows paths."
+        ],
+        "compatibility_risks": [
+          "Some persisted records rely on historical rebasing. Deleting all legacy handling would trade the current bug for migration regressions.",
+          "The current serializer may already have written prefixed paths such as voicebox/generations/.... Correcting future serialization does not automatically fix them.",
+          "A blanket DB restore after users create new generations would discard newer writes. Prefer targeted recorded value reversal for any migration.",
+          "Changing interpretation of external absolute paths is a separate policy decision and should be documented, not smuggled into this fix."
+        ],
+        "rollback": {
+          "code": "Revert serializer/reader changes together with their relevant compatibility tests if necessary; leave audio files untouched.",
+          "data": "Before any approved migration, retain a consistent SQLite/data backup and a per-row old/new mapping. Roll back only mapped values where no subsequent user edit intervened; avoid a full restore after new writes.",
+          "fallback": "Run only in a verified unaffected root until a safe repair is available. Existing bad rows remain OPEN unless explicitly recovered."
+        }
+      },
+      {
+        "id": "VB-3",
+        "status": "OPEN",
+        "severity": "Medium",
+        "classification": "Confirmed",
+        "title": "Omitting engine overrides the selected voice profile default with qwen",
+        "evidence": "GenerationRequest.engine is Optional but defaults to qwen. routes/generations.py:52-53 resolves data.engine or profile.default_engine or profile.preset_engine, so the profile fallbacks are unreachable for an omitted engine. For a Kokoro preset, validate_profile_engine rejects the unintended qwen value (services/profiles.py:114-135). Both /generate and /generate/stream use this resolver.",
+        "impact": "API clients sending the documented minimal profile_id/text request cannot use Kokoro or Qwen CustomVoice preset profiles without explicitly supplying engine or null. A cloned profile with a different default engine also uses qwen silently, potentially loading the wrong model.",
+        "validation_already_performed": "Instantiated the actual GenerationRequest with no engine and confirmed engine == qwen; applying the route resolver expression to a kokoro default resolves qwen. No inference was needed. Reproduction is in /workspace/review/voicebox_repro.py.",
+        "affected_workflows": [
+          "External API clients omitting engine",
+          "Kokoro and Qwen CustomVoice preset generation",
+          "Cloned profiles with an explicit default engine"
+        ],
+        "change_surface": [
+          {
+            "file": "backend/models.py",
+            "lines": [
+              79,
+              101
+            ],
+            "purpose": "GenerationRequest engine default and OpenAPI schema"
+          },
+          {
+            "file": "backend/routes/generations.py",
+            "lines": [
+              52,
+              53,
+              65,
+              77,
+              332,
+              345
+            ],
+            "purpose": "Shared engine resolver plus persisted/stream generation validation"
+          },
+          {
+            "file": "backend/services/profiles.py",
+            "lines": [
+              114,
+              135
+            ],
+            "purpose": "Preserve preset/cloning engine compatibility validation"
+          },
+          {
+            "file": "app/src/lib/api/types.ts",
+            "lines": [
+              1
+            ],
+            "purpose": "Review generated/manual request type compatibility if API schema changes"
+          },
+          {
+            "file": "scripts/generate-api.sh",
+            "lines": [
+              1
+            ],
+            "purpose": "Review schema/type generation workflow before regenerating artifacts"
+          }
+        ],
+        "recommended_implementation": "Default the optional engine field to None so omission follows the existing resolver: explicit request engine, profile.default_engine, profile.preset_engine, then qwen. Keep engine/profile validation intact.",
+        "repair_steps": [
+          "Add request/route tests for omitted engine and explicit null, using preset and cloned profiles and a fake inference backend.",
+          "Change the Pydantic default for GenerationRequest.engine from qwen to None. Keep the existing enum/pattern validation for non-null values.",
+          "Retain qwen only as the final resolver fallback for profiles without configured defaults. Do not remove explicit request override precedence.",
+          "Verify both /generate and /generate/stream use the same resolver and choose a compatible model_size where applicable.",
+          "Review OpenAPI/generated request types and documented minimal requests. Explicit qwen clients must continue behaving as before."
+        ],
+        "invariants": [
+          "Omitted and explicit-null engine use profile metadata when available.",
+          "Explicit non-null request engine remains the first choice, subject to compatibility validation.",
+          "A profile with no engine metadata still resolves to qwen.",
+          "Preset profiles cannot silently run a different engine, and invalid engine strings are rejected."
+        ],
+        "acceptance_criteria": [
+          "Minimal profile_id/text requests for Kokoro and CustomVoice preset profiles resolve to their preset engine without an unintended qwen validation error.",
+          "A cloned profile defaulting to a supported non-qwen cloning engine uses that engine on omission.",
+          "Explicit qwen, explicit null, incompatible preset overrides and missing-profile cases preserve documented behavior.",
+          "Request schema/type changes do not make existing explicit-engine callers invalid."
+        ],
+        "regression_cases": [
+          "Engine omitted, engine=null, explicit matching engine, explicit incompatible preset engine and invalid engine string.",
+          "Preset with default_engine set; preset with only preset_engine; cloned profile with non-qwen default; profile without default metadata.",
+          "Both persisted and streaming endpoints resolve the same engine for the same profile/request.",
+          "Existing frontend clients that send their selected engine continue using it."
+        ],
+        "compatibility_risks": [
+          "Clients that omitted engine and unintentionally relied on always using qwen will now honor the profile default. This intended behavior change should be called out in release notes.",
+          "Optional-null API types may differ across generated clients. Check generated OpenAPI/types rather than changing unrelated frontend selection logic.",
+          "Model-size defaults were not separately validated against every engine; run preset-engine endpoint tests to avoid loading an inappropriate model variant."
+        ],
+        "rollback": {
+          "code": "Revert the request-default change and related schema artifacts together. No data migration is needed.",
+          "fallback": "Callers explicitly supply a matching engine or null until the corrected default can ship.",
+          "data": "Do not rewrite persisted historical generation.engine values as part of this fix."
+        }
+      },
+      {
+        "id": "VB-4",
+        "status": "OPEN",
+        "severity": "Medium",
+        "classification": "Confirmed",
+        "title": "Stream generation silently discards the voice profile effects chain",
+        "evidence": "stream_speech gets profile from services.profiles.get_profile, which returns _profile_to_response (profiles.py:277). That converts stored effects JSON into List[EffectConfig] (profiles.py:35-42; models.py:39). The stream fallback calls json.loads(profile.effects_chain), catches the resulting TypeError, and sets effects_chain_config=None.",
+        "impact": "POST /generate/stream without an explicit request effects_chain always ignores enabled profile default effects, while persisted /generate correctly loads effects from the database JSON. Streaming audio does not match the configured voice.",
+        "validation_already_performed": "Constructed an actual VoiceProfileResponse with enabled reverb EffectConfig and verified the exact json.loads operation raises TypeError because the value is a list. The route catches this and skips apply_effects. Reproduction is in /workspace/review/voicebox_repro.py.",
+        "affected_workflows": [
+          "POST /generate/stream relying on profile effects defaults",
+          "API clients expecting streamed and saved voice effects to agree"
+        ],
+        "change_surface": [
+          {
+            "file": "backend/routes/generations.py",
+            "lines": [
+              379,
+              398
+            ],
+            "purpose": "Effects precedence and serialization for streamed WAV generation"
+          },
+          {
+            "file": "backend/services/profiles.py",
+            "lines": [
+              30,
+              62,
+              259,
+              278
+            ],
+            "purpose": "Profile response is already parsed into EffectConfig instances"
+          },
+          {
+            "file": "backend/models.py",
+            "lines": [
+              31,
+              39,
+              100,
+              101
+            ],
+            "purpose": "Response effects type and explicit-request override contract"
+          },
+          {
+            "file": "backend/services/generation.py",
+            "lines": [
+              175,
+              233
+            ],
+            "purpose": "Persisted generation effects behavior used for parity checks"
+          },
+          {
+            "file": "backend/utils/effects.py",
+            "lines": [
+              1
+            ],
+            "purpose": "Consumer expects serialized effect dictionaries; inspect validation/application behavior before changing caller"
+          }
+        ],
+        "recommended_implementation": "Use the typed profile effects list directly, serializing each EffectConfig with model_dump rather than passing the list through json.loads. Preserve request override, explicit empty-list disablement and no-effects semantics.",
+        "repair_steps": [
+          "Add a streaming route regression where get_profile returns a real VoiceProfileResponse with enabled default effects and apply_effects is instrumented.",
+          "Replace the erroneous JSON parse of profile.effects_chain with serialization from its typed objects. Keep JSON parsing at the DB/profile-conversion boundary only.",
+          "Preserve data.effects_chain is not None as the override check so an explicit empty list disables profile defaults.",
+          "Verify enabled/disabled flags and params survive serialization and effects are applied once before the currently established normalization step.",
+          "If sharing a small effects-resolution helper with persisted generation, keep it limited to precedence/type conversion. Do not fold in unrelated synthesis or versioning refactors."
+        ],
+        "invariants": [
+          "Profile effects defaults are applied when request effects are omitted/null and a valid default chain exists.",
+          "Explicit request effects override profile defaults; explicit [] means no effects.",
+          "No effects are applied more than once, and parameter values/order/enablement are preserved.",
+          "Corrupt stored JSON remains handled at the profile deserialization boundary; the route must not silently swallow a type-contract programming error."
+        ],
+        "acceptance_criteria": [
+          "Streaming endpoint calls apply_effects with the expected profile chain when no request override is supplied.",
+          "Explicit request chain replaces the profile chain and [] skips application.",
+          "Profile with no default effects still streams valid WAV without invoking effect processing.",
+          "For deterministic fake inference, persisted and streamed flows resolve the same effective chain; real audio smoke test confirms the intended audible result."
+        ],
+        "regression_cases": [
+          "Profile effects None/empty/one enabled effect/multiple ordered effects with mixed enabled flags.",
+          "Request chain omitted/null/explicit chain/explicit empty list.",
+          "Effect parameters contain supported scalar values and survive model_dump unchanged.",
+          "Normalization on/off preserves established processing order and valid WAV response headers.",
+          "Malformed legacy profile effects JSON is handled by existing profile conversion behavior, not accidentally reintroduced into the stream parser."
+        ],
+        "compatibility_risks": [
+          "Streaming output will intentionally change for voices whose default effects were previously ignored.",
+          "Effects can alter duration, amplitude or timbre; preserve existing processing order and validate clipping/normalization with representative audio.",
+          "A generalized helper should not reinterpret [] as missing or mutate the profile/request chain."
+        ],
+        "rollback": {
+          "code": "Revert the stream effects-resolution patch if required; this restores the known missing-effects behavior and does not close the finding.",
+          "fallback": "Send effects explicitly or use persisted /generate.",
+          "data": "No profile DB or generated audio migration is required; do not rewrite existing files."
+        }
+      }
+    ],
+    "verification_debt": [
+      {
+        "id": "VB-VD-1",
+        "status": "OPEN",
+        "classification": "Verification debt, not another runtime finding",
+        "title": "Progress tracker test expects callbacks for a fixture intentionally below the reporting threshold",
+        "evidence": [
+          {
+            "file": "backend/tests/test_progress.py",
+            "lines": [
+              142,
+              149
+            ],
+            "purpose": "Fixture total_size=1000 and assertion requiring callbacks"
+          },
+          {
+            "file": "backend/utils/hf_progress.py",
+            "lines": [
+              145,
+              154,
+              304,
+              311
+            ],
+            "purpose": "Both tracking paths intentionally suppress totals below 1,000,000 bytes"
+          }
+        ],
+        "diagnosis": "The isolated test fails identically under huggingface-hub 2.2.0/tqdm 4.70.1 and huggingface-hub 0.36.0/tqdm 4.67.3. An actual tracker probe emits 0 callbacks for a 1,000-byte total and 1 callback for a 2,000,000-byte total. The inconsistency is the existing fixture/assertion, not evidence of broken large-file progress tracking.",
+        "proposed_repair": [
+          "Use a fixture total at/above the intentional threshold for the positive callback test.",
+          "Add a separate below-threshold assertion that no progress callback is emitted.",
+          "Exercise both standard tracked tqdm and the supported HuggingFace progress hook at bounded dependency versions.",
+          "Keep terminal complete/error SSE behavior covered independently from byte progress."
+        ],
+        "acceptance_criteria": [
+          "Positive and below-threshold tests describe the intentional behavior and pass.",
+          "Selected lightweight suite has no unexplained failure.",
+          "No runtime threshold change is introduced solely to make the old 1,000-byte fixture pass."
+        ],
+        "rollback": "Test-only change can be reverted without affecting runtime, but the known stale failure returns."
+      },
+      {
+        "id": "VB-VD-2",
+        "status": "OPEN",
+        "classification": "Verification coverage gap",
+        "title": "Configured default CI does not run the backend regression suite",
+        "evidence": [
+          {
+            "file": ".github/workflows/ci.yml",
+            "lines": [
+              9,
+              26
+            ],
+            "purpose": "frontend-quality job installs Bun, typechecks app/web and builds web only"
+          }
+        ],
+        "proposed_repair": [
+          "After runtime repairs are authorized, add a lightweight deterministic backend regression lane with supported Python/dependency versions.",
+          "Keep model-download/live-GPU tests in a separate explicit matrix with clear availability requirements.",
+          "Resolve package/import prerequisites before claiming backend suite coverage."
+        ],
+        "limitations": "No CI execution was performed by this reviewer. Root reported zero workflow runs on the fork; configuration presence is not proof of a successful run."
+      }
+    ],
+    "reproduction_and_validation": [
+      {
+        "name": "Four baseline bug-mechanism probes",
+        "status": "ALREADY RUN; baseline defect assertions passed",
+        "cwd": "/workspace",
+        "prerequisites": [
+          "Checkout at pinned SHA available as /workspace/repos/voicebox",
+          "Review artifact /workspace/review/voicebox_repro.py",
+          "Python 3.12.14; observed installed pydantic 2.13.4 and numpy 2.3.5"
+        ],
+        "command": "PYTHONPATH=/workspace/repos/voicebox python /workspace/review/voicebox_repro.py",
+        "observed": [
+          "Stored voicebox/generations/example.wav resolves to a doubled .../data/voicebox/voicebox/generations/example.wav path.",
+          "Second queued job starts while cancelled first thread remains blocked.",
+          "Omitted request engine becomes qwen despite a kokoro profile default.",
+          "json.loads on profile.effects_chain raises TypeError because it is a list."
+        ],
+        "safety_and_limits": "Uses temporary files and fake threaded work, no model weights or remote writes. The installed NumPy 2.3.5 is outside the repository runtime numpy<2 bound; these probes demonstrate stdlib/Pydantic/type/lifetime mechanisms, not compatibility of a full production model environment.",
+        "after_repair": "These scripts intentionally assert the current defect. A future fix should make the defect assertion fail; convert expected repaired behavior into maintained repository regressions instead of treating a passing defect probe as a release gate."
+      },
+      {
+        "name": "Unchanged production cancellation path challenge",
+        "status": "ALREADY RUN; overlap confirmed",
+        "cwd": "/workspace",
+        "prerequisites": [
+          "Same checkout and Python/NumPy environment",
+          "Review artifact /workspace/review/voicebox_production_cancellation_repro.py"
+        ],
+        "command": "PYTHONPATH=/workspace/repos/voicebox python /workspace/review/voicebox_production_cancellation_repro.py",
+        "observed": [
+          "Unchanged AST-extracted run_generation returned, recorded failed through a fake DB and closed its session before the first model thread finished.",
+          "The actual generate_chunked and task_queue modules plus unchanged PyTorch async generate method started and completed the second fake model call before the first was released.",
+          "Statuses before first release: first generating; first failed; second generating; second completed."
+        ],
+        "safety_and_limits": "AST extraction avoids importing Torch/weights while preserving inspected production async bodies. Fake model blocks on a thread event; DB/audio/backend lookup are doubles. Demonstrates ownership overlap, not an actual GPU OOM or native frontend click."
+      },
+      {
+        "name": "Python syntax inspection",
+        "status": "ALREADY RUN; passed",
+        "cwd": "/workspace/repos/voicebox",
+        "command": "python - <<'PYCODE'\nimport ast\nfrom pathlib import Path\nfiles = list(Path(\"backend\").rglob(\"*.py\"))\nfor path in files:\n    ast.parse(path.read_text(encoding=\"utf-8\"), filename=str(path))\nprint(len(files), \"files parsed\")\nPYCODE",
+        "observed": "120 backend Python files parsed; zero syntax errors.",
+        "limits": "Parsing is not an import, startup, model, lint or type check."
+      },
+      {
+        "name": "Selected lightweight backend suite",
+        "status": "ALREADY RUN; 33 passed, 1 failed",
+        "cwd": "/workspace/repos/voicebox",
+        "prerequisites": [
+          "Python 3.12 and uv",
+          "Network/package cache for listed lightweight dependencies",
+          "PYTHONPATH includes both backend and repository root because test_progress imports utils directly"
+        ],
+        "command": "PYTHONPATH=/workspace/repos/voicebox/backend:/workspace/repos/voicebox uv run --no-project --with pytest --with pytest-asyncio --with sqlalchemy --with fastapi --with httpx --with tqdm --with huggingface-hub python -m pytest backend/tests/test_task_queue_cancellation.py backend/tests/test_audio_failed_generation.py backend/tests/test_cors.py backend/tests/test_progress.py -q --disable-warnings",
+        "observed": "33 passed, 1 failed in 4.03s. Sole failure test_hf_progress_tracker is explained in VB-VD-1.",
+        "versions_observed": {
+          "python": "3.12.14",
+          "pytest": "9.1.1",
+          "huggingface-hub": "2.2.0",
+          "tqdm": "4.70.1"
+        },
+        "limits": "uv command resolved unbounded lightweight packages at review time, not a complete production dependency lock. Current Hub 2.2.0 is not established as compatible with all repository model packages. No complete backend suite or model weights were installed."
+      },
+      {
+        "name": "Isolated stale progress test under older dependencies",
+        "status": "ALREADY RUN; same expected stale fixture failure",
+        "cwd": "/workspace/repos/voicebox",
+        "prerequisites": [
+          "Python 3.12 and uv"
+        ],
+        "command": "PYTHONPATH=/workspace/repos/voicebox/backend:/workspace/repos/voicebox uv run --no-project --with pytest --with pytest-asyncio --with huggingface-hub==0.36.0 --with tqdm==4.67.3 python -m pytest backend/tests/test_progress.py::test_hf_progress_tracker -q --disable-warnings",
+        "observed": "1 failed in 1.14s; 0 progress callbacks for the 1,000-byte fixture, identical to current dependency behavior.",
+        "limits": "This isolates the fixture/threshold inconsistency; it does not certify either full model dependency environment."
+      },
+      {
+        "name": "Actual tracker threshold probe",
+        "status": "ALREADY RUN; threshold behavior confirmed",
+        "cwd": "/workspace/repos/voicebox",
+        "prerequisites": [
+          "Python 3.12 and uv; current probe environment used huggingface-hub 2.2.0 and tqdm 4.70.1"
+        ],
+        "command": "PYTHONPATH=/workspace/repos/voicebox/backend:/workspace/repos/voicebox uv run --no-project --with pytest --with pytest-asyncio --with sqlalchemy --with fastapi --with httpx --with tqdm --with huggingface-hub python - <<'PYCODE'\nfrom importlib.metadata import version\nfrom backend.utils.hf_progress import HFProgressTracker\nprint('huggingface-hub', version('huggingface-hub'), 'tqdm', version('tqdm'))\nfor size in (1000, 2000000):\n    reports = []\n    tracker = HFProgressTracker(lambda *args: reports.append(args))\n    with tracker.patch_download():\n        from tqdm import tqdm\n        with tqdm(total=size, desc='model.bin', unit='B', disable=True) as progress:\n            progress.update(size)\n    print('Total bytes:', size, 'callback count:', len(reports))\nPYCODE",
+        "observed": [
+          "Total bytes: 1000 callback count: 0",
+          "Total bytes: 2000000 callback count: 1"
+        ],
+        "limits": "No download or model inference takes place. The tracker force-enables its own accounting, so a terminal progress display can still appear despite disable=True in the probe."
+      },
+      {
+        "name": "Collection limit for MCP middleware tests",
+        "status": "NOT COMPLETED",
+        "command": "Initial selected test command also included backend/tests/test_client_id_middleware.py",
+        "observed": "Collection failed because fastmcp was not installed. Test excluded from later lightweight run.",
+        "limits": "Do not count this middleware test as passed or as a confirmed runtime defect."
+      }
+    ],
+    "release_validation_not_run": [
+      {
+        "check": "Production dependency environment",
+        "status": "NOT RUN",
+        "required_evidence": "Install the repository-supported full backend environment on each supported target; record exact versions and dependency conflicts. Lightweight uv environments above are not release qualification."
+      },
+      {
+        "check": "Real GPU cancellation",
+        "status": "NOT RUN",
+        "required_evidence": "On at least PyTorch/CUDA and Apple Silicon/MLX where supported, start a long inference, cancel through the actual UI, queue another and capture non-overlapping model execution, memory behavior and eventual cancellation status."
+      },
+      {
+        "check": "All supported adapter cancellation seams",
+        "status": "NOT RUN",
+        "required_evidence": "Maintained fake-model tests for each adapter/helper implementation and representative actual engine smoke tests; include model load/prompt creation cancellation."
+      },
+      {
+        "check": "Repeated cancel and sidecar shutdown",
+        "status": "NOT RUN",
+        "required_evidence": "Desktop close/reopen, watchdog/parent exit, repeated cancellation and backend restart complete without stranded processes, permanently active rows or generation overlap."
+      },
+      {
+        "check": "Custom data-root user workflow",
+        "status": "NOT RUN",
+        "required_evidence": "On disposable copied data under roots containing earlier data components, create profile/sample/avatar/capture/generation versions, restart, play/export each file and verify all references. Run any approved legacy recovery dry-run and targeted rollback."
+      },
+      {
+        "check": "Engine-default endpoint integration",
+        "status": "NOT RUN",
+        "required_evidence": "Real minimal API requests for Kokoro/CustomVoice presets and a non-qwen cloned default use the intended engine; explicit override/null/error cases remain correct."
+      },
+      {
+        "check": "Actual effects audio parity",
+        "status": "NOT RUN",
+        "required_evidence": "Stream and save deterministic/representative audio using profile defaults and overrides; verify expected effects, WAV validity and normalization/clipping behavior."
+      },
+      {
+        "check": "Frontend/native build and packaging",
+        "status": "NOT RUN",
+        "required_evidence": "Bun install/typecheck/web build, Rust/Tauri packaging and supported OS native capture/playback flows pass with the repaired backend."
+      },
+      {
+        "check": "Complete backend/MCP suite",
+        "status": "NOT RUN",
+        "required_evidence": "Install required imports including fastmcp, run applicable deterministic suite with clear separation of tests requiring a running server/model/GPU, and retain results."
+      },
+      {
+        "check": "CI/release execution and rollback rehearsal",
+        "status": "NOT RUN",
+        "required_evidence": "Execute authorized CI/release gates, stage signed artifacts as applicable, test application rollback and any path-record reversal on disposable copied data before production rollout."
+      }
+    ],
+    "completion_conditions": [
+      "All four findings remain OPEN in this handoff. Implementation, commits, remote writes and releases require separate authorization.",
+      "Close each defect only with an applied repair, maintained expected-behavior regression, relevant integration evidence and documented compatibility/rollback results.",
+      "Keep stale progress-test debt separate from runtime finding counts.",
+      "A passing parse/probe/lightweight suite is not a claim of full GPU, desktop, dependency-security or release coverage."
+    ]
+  },
+  "handoff_date": "2026-10-22",
+  "all_findings_status": "OPEN",
+  "implementation_status": "No repairs applied; proposed work only.",
+  "delivery_notes": {
+    "destination_repository": "wwongw21/voicebox",
+    "status": "All findings remain OPEN; documentation transfer only.",
+    "portable_evidence": "This JSON retains the complete repository-specific handoff. Historical /workspace paths are evidence references and prerequisites, not portable hyperlinks. Applicable repository-specific diagnostics are included alongside the report.",
+    "diagnostics_included": [
+      "voicebox_repro.py",
+      "voicebox_production_cancellation_repro.py"
+    ],
+    "not_included": "Original environments, model weights, user data and complete source snapshots are not included. Clone the pinned source and follow the recorded prerequisites. Bug-demonstration scripts intentionally assert pre-fix behavior; they are not a post-fix passing suite."
+  }
+}
