@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 from fastapi import FastAPI, HTTPException
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 from starlette.testclient import TestClient
 
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
@@ -27,8 +29,10 @@ if not _torch_available:
     _torch_stubbed = True
 
 from backend import models
-from backend.database import get_db
+from backend.database import Base, Generation, VoiceProfile, get_db
 from backend.routes import generations
+from backend.services import history, task_queue
+from backend.utils.tasks import get_task_manager
 
 if _torch_stubbed:
     sys.modules.pop("torch", None)
@@ -382,3 +386,63 @@ async def test_both_generation_routes_choose_compatible_preset_model_size(monkey
     assert loaded["engine"] == "qwen_custom_voice"
     assert loaded["cache"] == ("qwen_custom_voice", "1.7B")
     assert loaded["load"] == ("qwen_custom_voice", "1.7B")
+
+
+@pytest.mark.parametrize("invalid_effects_json", ["[1]", '{"type":"gain"}'])
+@pytest.mark.asyncio
+async def test_invalid_legacy_effects_do_not_orphan_a_persisted_generation(
+    tmp_path, monkeypatch, invalid_effects_json
+):
+    engine = create_engine(f"sqlite:///{(tmp_path / 'generation.sqlite').as_posix()}")
+    Base.metadata.create_all(bind=engine)
+    session_factory = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    db = session_factory()
+    db.add(
+        VoiceProfile(
+            id="profile-invalid-effects",
+            name="Invalid Effects",
+            voice_type="cloned",
+            effects_chain=invalid_effects_json,
+        )
+    )
+    db.commit()
+
+    task_manager = get_task_manager()
+    task_queue.init_queue(force=True)
+
+    async def fake_run_generation(**kwargs):
+        background_db = session_factory()
+        try:
+            await history.update_generation_status(
+                generation_id=kwargs["generation_id"],
+                status="failed",
+                db=background_db,
+                error="fake inference failed",
+            )
+        finally:
+            background_db.close()
+            task_manager.complete_generation(kwargs["generation_id"])
+
+    monkeypatch.setattr(generations, "run_generation", fake_run_generation)
+
+    try:
+        response = await generations.generate_speech(
+            models.GenerationRequest(
+                profile_id="profile-invalid-effects",
+                text="Hello",
+            ),
+            db,
+        )
+
+        await task_queue._generation_queue.join()
+
+        db.expire_all()
+        saved = db.query(Generation).filter_by(id=response.id).first()
+        assert saved is not None
+        assert saved.status == "failed"
+        assert saved.error == "fake inference failed"
+        assert not task_manager.is_generation_active(response.id)
+    finally:
+        db.close()
+        await task_queue.shutdown_queue()
+        engine.dispose()

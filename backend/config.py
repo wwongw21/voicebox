@@ -31,12 +31,8 @@ def _path_relative_to_any_data_dir(path: Path) -> Path | None:
             continue
 
         tail = parts[idx + 1 :]
-        for subdirectory_idx, subdirectory in enumerate(tail):
-            if (
-                subdirectory in _DATA_SUBDIRECTORIES
-                and len(tail) - subdirectory_idx >= 2
-            ):
-                return Path(*tail[subdirectory_idx:])
+        if len(tail) >= 2 and tail[0] in _DATA_SUBDIRECTORIES:
+            return Path(*tail)
 
     return None
 

@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 from fastapi import FastAPI
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
 from starlette.testclient import TestClient
 
@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
 from backend import config
 from backend.database import Base, Generation, VoiceProfile, get_db
+from backend.database.migrations import _normalize_storage_paths
 from backend.routes.audio import router as audio_router
 
 
@@ -164,13 +165,82 @@ def test_absolute_path_with_only_a_matching_basename_is_not_rebased(
     assert config.resolve_storage_path(original) == original.resolve()
 
 
-def test_legacy_absolute_path_with_old_named_data_root_remains_readable(
+def test_absolute_external_path_with_intervening_directory_is_not_rebased(
+    tmp_path, monkeypatch
+):
+    data_dir = tmp_path / "voicebox-store"
+    original = tmp_path / "archive" / "data" / "shared" / "profiles" / "p" / "avatar.png"
+    unrelated = data_dir / "profiles" / "p" / "avatar.png"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_bytes(b"current avatar")
+    monkeypatch.setattr(config, "_data_dir", data_dir.resolve())
+
+    assert config.resolve_storage_path(original) == original.resolve()
+
+
+def test_startup_path_normalization_keeps_ambiguous_external_row_unchanged(
+    tmp_path, monkeypatch
+):
+    data_dir = tmp_path / "voicebox-store"
+    original = tmp_path / "archive" / "data" / "shared" / "profiles" / "p" / "avatar.png"
+    unrelated = data_dir / "profiles" / "p" / "avatar.png"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_bytes(b"current avatar")
+    monkeypatch.setattr(config, "_data_dir", data_dir.resolve())
+
+    engine = create_engine(f"sqlite:///{(tmp_path / 'migration.sqlite').as_posix()}")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE profiles (id TEXT PRIMARY KEY, avatar_path TEXT)"))
+        connection.execute(
+            text("INSERT INTO profiles (id, avatar_path) VALUES ('profile-1', :path)"),
+            {"path": str(original)},
+        )
+
+    _normalize_storage_paths(engine, {"profiles"})
+
+    with engine.connect() as connection:
+        stored_path = connection.execute(
+            text("SELECT avatar_path FROM profiles WHERE id='profile-1'")
+        ).scalar_one()
+    engine.dispose()
+
+    assert stored_path == str(original)
+
+
+def test_startup_path_normalization_does_not_guess_through_intervening_directories(
+    tmp_path, monkeypatch
+):
+    data_dir = tmp_path / "voicebox-store"
+    original = tmp_path / "archive" / "data" / "shared" / "profiles" / "p" / "avatar.png"
+    unrelated = data_dir / "profiles" / "p" / "avatar.png"
+    unrelated.parent.mkdir(parents=True)
+    unrelated.write_bytes(b"unrelated current avatar")
+    monkeypatch.setattr(config, "_data_dir", data_dir.resolve())
+
+    engine = create_engine(f"sqlite:///{(tmp_path / 'ambiguous.sqlite').as_posix()}")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE profiles (id TEXT PRIMARY KEY, avatar_path TEXT)"))
+        connection.execute(
+            text("INSERT INTO profiles (id, avatar_path) VALUES ('profile-1', :path)"),
+            {"path": str(original)},
+        )
+
+    _normalize_storage_paths(engine, {"profiles"})
+
+    with engine.connect() as connection:
+        stored_path = connection.execute(
+            text("SELECT avatar_path FROM profiles WHERE id='profile-1'")
+        ).scalar_one()
+    engine.dispose()
+
+    assert stored_path == str(original)
+
+
+def test_legacy_absolute_path_with_standard_data_root_remains_readable(
     tmp_path, monkeypatch
 ):
     data_dir = tmp_path / "new-root" / "data" / "voicebox"
-    old_absolute_path = (
-        tmp_path / "old-root" / "data" / "voicebox" / "generations" / "old.wav"
-    )
+    old_absolute_path = tmp_path / "old-root" / "data" / "generations" / "old.wav"
     current_file = data_dir / "generations" / "old.wav"
     current_file.parent.mkdir(parents=True)
     current_file.write_bytes(b"moved data")

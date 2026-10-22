@@ -154,17 +154,7 @@ async def generate_speech(
         text=text,
     )
 
-    profile_effects = None
-    if data.effects_chain is None:
-        import json as _json
-
-        profile_obj = db.query(DBVoiceProfile).filter_by(id=data.profile_id).first()
-        if profile_obj and profile_obj.effects_chain:
-            try:
-                profile_effects = _json.loads(profile_obj.effects_chain)
-            except Exception:
-                pass
-    effects_chain_config = _resolve_effects_chain(data.effects_chain, profile_effects)
+    effects_chain_config = _resolve_effects_chain(data.effects_chain, profile.effects_chain)
 
     enqueue_generation(
         generation_id,
