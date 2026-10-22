@@ -31,6 +31,12 @@ from .base import (
 )
 from ..utils.cache import get_cache_key, get_cached_voice_prompt, cache_voice_prompt
 
+from ..utils.model_lifecycle import (
+    create_model_operation_lock,
+    protect_model_unload,
+    run_model_thread,
+)
+
 logger = logging.getLogger(__name__)
 
 # HuggingFace repos
@@ -59,6 +65,7 @@ class HumeTadaBackend:
     _load_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self):
+        self._model_operation_lock = create_model_operation_lock()
         self.model = None
         self.encoder = None
         self.model_size = "1B"  # default to 1B
@@ -93,7 +100,7 @@ class HumeTadaBackend:
             if self.model is not None:
                 self.unload_model()
             self.model_size = model_size
-            await asyncio.to_thread(self._load_model_sync, model_size)
+            await run_model_thread(self._model_operation_lock, self._load_model_sync, model_size)
 
     def _load_model_sync(self, model_size: str = "1B"):
         """Synchronous model loading with progress tracking."""
@@ -192,6 +199,7 @@ class HumeTadaBackend:
 
         logger.info(f"HumeAI TADA {model_size} loaded successfully on {device}")
 
+    @protect_model_unload
     def unload_model(self) -> None:
         """Unload model and encoder to free memory."""
         if self.model is not None:
@@ -270,7 +278,7 @@ class HumeTadaBackend:
                     prompt_dict[field_name] = val
             return prompt_dict
 
-        encoded = await asyncio.to_thread(_encode_sync)
+        encoded = await run_model_thread(self._model_operation_lock, _encode_sync)
 
         if cache_key:
             cache_voice_prompt(cache_key, encoded)
@@ -355,4 +363,4 @@ class HumeTadaBackend:
 
             return audio, 24000
 
-        return await asyncio.to_thread(_generate_sync)
+        return await run_model_thread(self._model_operation_lock, _generate_sync)

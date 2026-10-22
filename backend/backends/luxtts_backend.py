@@ -22,6 +22,12 @@ from .base import (
 )
 from ..utils.cache import get_cache_key, get_cached_voice_prompt, cache_voice_prompt
 
+from ..utils.model_lifecycle import (
+    create_model_operation_lock,
+    protect_model_unload,
+    run_model_thread,
+)
+
 logger = logging.getLogger(__name__)
 
 # HuggingFace repo for model weight detection
@@ -32,6 +38,7 @@ class LuxTTSBackend:
     """LuxTTS backend for zero-shot voice cloning."""
 
     def __init__(self):
+        self._model_operation_lock = create_model_operation_lock()
         self.model = None
         self.model_size = "default"  # LuxTTS has only one model size
         self._device = None
@@ -62,7 +69,7 @@ class LuxTTSBackend:
         if self.model is not None:
             return
 
-        await asyncio.to_thread(self._load_model_sync)
+        await run_model_thread(self._model_operation_lock, self._load_model_sync)
 
     def _load_model_sync(self):
         model_name = "luxtts"
@@ -88,6 +95,7 @@ class LuxTTSBackend:
 
         logger.info("LuxTTS loaded successfully")
 
+    @protect_model_unload
     def unload_model(self) -> None:
         """Unload model to free memory."""
         if self.model is not None:
@@ -130,7 +138,7 @@ class LuxTTSBackend:
                 rms=0.01,
             )
 
-        encoded = await asyncio.to_thread(_encode_sync)
+        encoded = await run_model_thread(self._model_operation_lock, _encode_sync)
 
         if cache_key:
             cache_voice_prompt(cache_key, encoded)
@@ -181,4 +189,4 @@ class LuxTTSBackend:
             audio = wav.detach().cpu().numpy().squeeze()
             return audio, 48000
 
-        return await asyncio.to_thread(_generate_sync)
+        return await run_model_thread(self._model_operation_lock, _generate_sync)

@@ -29,6 +29,12 @@ from .base import (
     model_load_progress,
 )
 
+from ..utils.model_lifecycle import (
+    create_model_operation_lock,
+    protect_model_unload,
+    run_model_thread,
+)
+
 logger = logging.getLogger(__name__)
 
 # HuggingFace repo for model + voice detection
@@ -125,6 +131,7 @@ class KokoroTTSBackend:
     """Kokoro-82M TTS backend — tiny, fast, CPU-friendly."""
 
     def __init__(self):
+        self._model_operation_lock = create_model_operation_lock()
         self._model = None
         self._pipelines: dict = {}  # lang_code -> KPipeline
         self._device: Optional[str] = None
@@ -162,7 +169,7 @@ class KokoroTTSBackend:
         """Load the Kokoro model."""
         if self._model is not None:
             return
-        await asyncio.to_thread(self._load_model_sync)
+        await run_model_thread(self._model_operation_lock, self._load_model_sync)
 
     def _load_model_sync(self):
         """Synchronous model loading."""
@@ -195,6 +202,7 @@ class KokoroTTSBackend:
 
         return self._pipelines[kokoro_lang]
 
+    @protect_model_unload
     def unload_model(self) -> None:
         """Unload model to free memory."""
         if self._model is not None:
@@ -290,4 +298,4 @@ class KokoroTTSBackend:
             audio = np.concatenate(audio_chunks)
             return audio.astype(np.float32), KOKORO_SAMPLE_RATE
 
-        return await asyncio.to_thread(_generate_sync)
+        return await run_model_thread(self._model_operation_lock, _generate_sync)
