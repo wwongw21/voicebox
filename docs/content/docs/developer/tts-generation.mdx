@@ -142,7 +142,9 @@ The request path from frontend to audio file:
      "max_chunk_chars": 800
    }
    ```
-   The `engine` field is validated against the regex `^(qwen|qwen_custom_voice|luxtts|chatterbox|chatterbox_turbo|tada|kokoro)$`.
+   `engine` may be omitted or `null`. Voicebox then checks the profile's default engine, then its preset engine, and falls back to Qwen when the profile has no engine metadata. An explicit engine is still an override and must be compatible with the profile.
+
+   `model_size` is optional. Qwen and CustomVoice default to `1.7B`; TADA defaults to `1B`. Unsupported sizes are rejected for these multi-size engines, and single-size engines ignore the field. Valid engine names are `qwen`, `qwen_custom_voice`, `luxtts`, `chatterbox`, `chatterbox_turbo`, `tada`, and `kokoro`.
 
 2. **Route** — `routes/generate.py` validates input and delegates.
 
@@ -154,7 +156,10 @@ The request path from frontend to audio file:
 
 6. **Inference** — the engine's `generate()` returns `(audio_array, sample_rate)`.
 
-7. **Validate and post-process** — engines with `retries_runaway=True` retry unstable output as smaller chunks. If `engine_needs_trim(engine)` is True, `trim_tts_output()` strips trailing silence. Effects chains (if any) are applied per generation version, not the clean version.
+7. **Validate and post-process** — engines with `retries_runaway=True` retry unstable output as smaller chunks. If
+   `engine_needs_trim(engine)` is True, `trim_tts_output()` strips trailing silence. Persisted `/generate` saves a
+   processed version alongside the clean version. `/generate/stream` applies request effects when supplied; otherwise
+   it applies the profile's default effects. An explicit empty `effects_chain` disables those defaults.
 
 8. **Persist** — audio is written to the generations directory, a row is inserted into the `generations` table, and the response includes the generation metadata.
 

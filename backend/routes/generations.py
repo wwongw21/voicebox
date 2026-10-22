@@ -50,7 +50,53 @@ def _get_or_create_import_profile(db: Session) -> DBVoiceProfile:
 
 
 def _resolve_generation_engine(data: models.GenerationRequest, profile) -> str:
-    return data.engine or getattr(profile, "default_engine", None) or getattr(profile, "preset_engine", None) or "qwen"
+    if data.engine is not None:
+        return data.engine
+    return (
+        getattr(profile, "default_engine", None)
+        or getattr(profile, "preset_engine", None)
+        or "qwen"
+    )
+
+
+def _resolve_generation_model_size(
+    data: models.GenerationRequest,
+    engine: str,
+) -> str | None:
+    """Choose the default variant for engines that expose multiple sizes."""
+    choices = {
+        "qwen": {"0.6B", "1.7B"},
+        "qwen_custom_voice": {"0.6B", "1.7B"},
+        "tada": {"1B", "3B"},
+    }
+    defaults = {"qwen": "1.7B", "qwen_custom_voice": "1.7B", "tada": "1B"}
+    supported = choices.get(engine)
+    if supported is None:
+        return None
+
+    model_size = data.model_size or defaults[engine]
+    if model_size not in supported:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model size {model_size} is not supported by engine {engine}",
+        )
+    return model_size
+
+
+def _serialize_effects_chain(effects_chain) -> list[dict] | None:
+    """Convert typed or already-decoded effects into the shared dict form."""
+    if effects_chain is None:
+        return None
+    return [
+        effect.model_dump() if hasattr(effect, "model_dump") else dict(effect)
+        for effect in effects_chain
+    ]
+
+
+def _resolve_effects_chain(request_effects, profile_effects) -> list[dict] | None:
+    """Apply request-over-profile precedence while preserving explicit []."""
+    selected = request_effects if request_effects is not None else profile_effects
+    return _serialize_effects_chain(selected)
 
 
 @router.post("/generate", response_model=models.GenerationResponse)
@@ -66,15 +112,13 @@ async def generate_speech(
     if not profile:
         raise HTTPException(status_code=404, detail="Profile not found")
 
-    from ..backends import engine_has_model_sizes
-
     engine = _resolve_generation_engine(data, profile)
     try:
         profiles.validate_profile_engine(profile, engine)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
-    model_size = (data.model_size or "1.7B") if engine_has_model_sizes(engine) else None
+    model_size = _resolve_generation_model_size(data, engine)
 
     text = data.text
     source = "manual"
@@ -100,7 +144,7 @@ async def generate_speech(
         generation_id=generation_id,
         status="generating",
         engine=engine,
-        model_size=model_size if engine_has_model_sizes(engine) else None,
+        model_size=model_size,
         source=source,
     )
 
@@ -110,18 +154,17 @@ async def generate_speech(
         text=text,
     )
 
-    effects_chain_config = None
-    if data.effects_chain is not None:
-        effects_chain_config = [e.model_dump() for e in data.effects_chain]
-    else:
+    profile_effects = None
+    if data.effects_chain is None:
         import json as _json
 
         profile_obj = db.query(DBVoiceProfile).filter_by(id=data.profile_id).first()
         if profile_obj and profile_obj.effects_chain:
             try:
-                effects_chain_config = _json.loads(profile_obj.effects_chain)
+                profile_effects = _json.loads(profile_obj.effects_chain)
             except Exception:
                 pass
+    effects_chain_config = _resolve_effects_chain(data.effects_chain, profile_effects)
 
     enqueue_generation(
         generation_id,
@@ -339,10 +382,10 @@ async def stream_speech(
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     tts_model = get_tts_backend_for_engine(engine)
-    model_size = data.model_size or "1.7B"
+    model_size = _resolve_generation_model_size(data, engine)
 
-    await ensure_model_cached_or_raise(engine, model_size)
-    await load_engine_model(engine, model_size)
+    await ensure_model_cached_or_raise(engine, model_size or "default")
+    await load_engine_model(engine, model_size or "default")
 
     voice_prompt = await profiles.create_voice_prompt_for_profile(
         data.profile_id,
@@ -376,16 +419,7 @@ async def stream_speech(
         runaway_detector=runaway_detector,
     )
 
-    effects_chain_config = None
-    if data.effects_chain is not None:
-        effects_chain_config = [e.model_dump() for e in data.effects_chain]
-    elif profile.effects_chain:
-        import json as _json
-
-        try:
-            effects_chain_config = _json.loads(profile.effects_chain)
-        except Exception:
-            effects_chain_config = None
+    effects_chain_config = _resolve_effects_chain(data.effects_chain, profile.effects_chain)
 
     if effects_chain_config:
         from ..utils.effects import apply_effects

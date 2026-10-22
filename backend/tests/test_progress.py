@@ -4,7 +4,6 @@ Test script to debug model download progress tracking.
 
 import asyncio
 import json
-import time
 from typing import List, Dict
 import logging
 
@@ -139,11 +138,11 @@ def test_hf_progress_tracker():
 
             # Simulate downloading a file
             print("  Simulating download with tqdm...")
-            total_size = 1000
+            # The tracker deliberately waits for 1 MB before reporting bytes.
+            total_size = 1_000_000
             with tqdm(total=total_size, desc="model.bin", unit="B", unit_scale=True) as pbar:
-                for chunk in range(0, total_size, 100):
-                    pbar.update(100)
-                    time.sleep(0.01)
+                for chunk in range(0, total_size, 100_000):
+                    pbar.update(100_000)
 
             print(f"  Captured {len(captured_progress)} progress updates")
             assert len(captured_progress) > 0, "Should have captured progress updates"
@@ -161,6 +160,25 @@ def test_hf_progress_tracker():
         except ImportError:
             print("✗ tqdm not available, skipping test\n")
             return None
+
+
+def test_hf_progress_tracker_suppresses_totals_below_threshold():
+    """Fixture-only coverage for the intentional 1 MB reporting threshold."""
+    captured_progress: List[tuple] = []
+    tracker = HFProgressTracker(
+        lambda downloaded, total, filename: captured_progress.append(
+            (downloaded, total, filename)
+        )
+    )
+    total_size = 999_999
+
+    with tracker.patch_download():
+        from tqdm import tqdm
+
+        with tqdm(total=total_size, desc="small-config.bin", unit="B", disable=True) as pbar:
+            pbar.update(total_size)
+
+    assert captured_progress == []
 
 
 async def test_full_integration():
