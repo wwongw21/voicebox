@@ -8,6 +8,12 @@ import logging
 import torch
 import numpy as np
 
+from ..utils.model_lifecycle import (
+    create_model_operation_lock,
+    protect_model_unload,
+    run_model_thread,
+)
+
 logger = logging.getLogger(__name__)
 
 from . import TTSBackend, STTBackend, LANGUAGE_CODE_TO_NAME, WHISPER_HF_REPOS
@@ -27,6 +33,7 @@ class PyTorchTTSBackend:
     """PyTorch-based TTS backend using Qwen3-TTS."""
 
     def __init__(self, model_size: str = "1.7B"):
+        self._model_operation_lock = create_model_operation_lock()
         self.model = None
         self.model_size = model_size
         self.device = self._get_device()
@@ -82,7 +89,7 @@ class PyTorchTTSBackend:
             self.unload_model()
 
         # Run blocking load in thread pool
-        await asyncio.to_thread(self._load_model_sync, model_size)
+        await run_model_thread(self._model_operation_lock, self._load_model_sync, model_size)
 
     # Alias for compatibility
     load_model = load_model_async
@@ -124,6 +131,7 @@ class PyTorchTTSBackend:
         self.model_size = model_size
         logger.info("TTS model %s loaded successfully", model_size)
 
+    @protect_model_unload
     def unload_model(self):
         """Unload the model to free memory."""
         if self.model is not None:
@@ -183,7 +191,7 @@ class PyTorchTTSBackend:
             )
 
         # Run blocking operation in thread pool
-        voice_prompt_items = await asyncio.to_thread(_create_prompt_sync)
+        voice_prompt_items = await run_model_thread(self._model_operation_lock, _create_prompt_sync)
 
         # Cache if enabled
         if use_cache:
@@ -240,7 +248,7 @@ class PyTorchTTSBackend:
             return wavs[0], sample_rate
 
         # Run blocking inference in thread pool to avoid blocking event loop
-        audio, sample_rate = await asyncio.to_thread(_generate_sync)
+        audio, sample_rate = await run_model_thread(self._model_operation_lock, _generate_sync)
 
         return audio, sample_rate
 

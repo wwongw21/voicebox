@@ -8,6 +8,12 @@ import logging
 import numpy as np
 from pathlib import Path
 
+from ..utils.model_lifecycle import (
+    create_model_operation_lock,
+    protect_model_unload,
+    run_model_thread,
+)
+
 logger = logging.getLogger(__name__)
 
 # PATCH: Import and apply offline patch BEFORE any huggingface_hub usage
@@ -26,6 +32,7 @@ class MLXTTSBackend:
     """MLX-based TTS backend using mlx-audio."""
 
     def __init__(self, model_size: str = "1.7B"):
+        self._model_operation_lock = create_model_operation_lock()
         self.model = None
         self.model_size = model_size
         self._current_model_size = None
@@ -82,7 +89,7 @@ class MLXTTSBackend:
             self.unload_model()
 
         # Run blocking load in thread pool
-        await asyncio.to_thread(self._load_model_sync, model_size)
+        await run_model_thread(self._model_operation_lock, self._load_model_sync, model_size)
 
     # Alias for compatibility
     load_model = load_model_async
@@ -104,6 +111,7 @@ class MLXTTSBackend:
         self.model_size = model_size
         logger.info("MLX TTS model %s loaded successfully", model_size)
 
+    @protect_model_unload
     def unload_model(self):
         """Unload the model to free memory."""
         if self.model is not None:
@@ -259,7 +267,7 @@ class MLXTTSBackend:
             return audio, sample_rate
 
         # Run blocking inference in thread pool
-        audio, sample_rate = await asyncio.to_thread(_generate_sync)
+        audio, sample_rate = await run_model_thread(self._model_operation_lock, _generate_sync)
 
         return audio, sample_rate
 

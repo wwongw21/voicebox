@@ -29,6 +29,12 @@ from .base import (
     model_load_progress,
 )
 
+from ..utils.model_lifecycle import (
+    create_model_operation_lock,
+    protect_model_unload,
+    run_model_thread,
+)
+
 logger = logging.getLogger(__name__)
 
 # ── Preset speakers ──────────────────────────────────────────────────
@@ -59,6 +65,7 @@ class QwenCustomVoiceBackend:
     """Qwen3-TTS CustomVoice backend — preset speakers with instruct control."""
 
     def __init__(self, model_size: str = "1.7B"):
+        self._model_operation_lock = create_model_operation_lock()
         self.model = None
         self.model_size = model_size
         self.device = self._get_device()
@@ -89,7 +96,7 @@ class QwenCustomVoiceBackend:
         if self.model is not None and self._current_model_size != model_size:
             self.unload_model()
 
-        await asyncio.to_thread(self._load_model_sync, model_size)
+        await run_model_thread(self._model_operation_lock, self._load_model_sync, model_size)
 
     # Alias for compatibility with the TTSBackend protocol
     load_model = load_model_async
@@ -121,6 +128,7 @@ class QwenCustomVoiceBackend:
         self.model_size = model_size
         logger.info("Qwen CustomVoice %s loaded successfully", model_size)
 
+    @protect_model_unload
     def unload_model(self) -> None:
         if self.model is not None:
             del self.model
@@ -210,5 +218,5 @@ class QwenCustomVoiceBackend:
             wavs, sample_rate = self.model.generate_custom_voice(**kwargs)
             return wavs[0], sample_rate
 
-        audio, sample_rate = await asyncio.to_thread(_generate_sync)
+        audio, sample_rate = await run_model_thread(self._model_operation_lock, _generate_sync)
         return audio, sample_rate

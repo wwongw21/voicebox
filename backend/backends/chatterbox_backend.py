@@ -25,6 +25,12 @@ from .base import (
     patch_chatterbox_f32,
 )
 
+from ..utils.model_lifecycle import (
+    create_model_operation_lock,
+    protect_model_unload,
+    run_model_thread,
+)
+
 logger = logging.getLogger(__name__)
 
 CHATTERBOX_HF_REPO = "ResembleAI/chatterbox"
@@ -44,6 +50,7 @@ class ChatterboxTTSBackend:
     _load_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self):
+        self._model_operation_lock = create_model_operation_lock()
         self.model = None
         self.model_size = "default"
         self._device = None
@@ -68,7 +75,7 @@ class ChatterboxTTSBackend:
         async with self._model_load_lock:
             if self.model is not None:
                 return
-            await asyncio.to_thread(self._load_model_sync)
+            await run_model_thread(self._model_operation_lock, self._load_model_sync)
 
     def _load_model_sync(self):
         """Synchronous model loading."""
@@ -112,6 +119,7 @@ class ChatterboxTTSBackend:
 
         logger.info("Chatterbox Multilingual TTS loaded successfully")
 
+    @protect_model_unload
     def unload_model(self) -> None:
         """Unload model to free memory."""
         if self.model is not None:
@@ -223,4 +231,4 @@ class ChatterboxTTSBackend:
 
             return audio, sample_rate
 
-        return await asyncio.to_thread(_generate_sync)
+        return await run_model_thread(self._model_operation_lock, _generate_sync)

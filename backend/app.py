@@ -359,6 +359,9 @@ async def _run_startup(application: FastAPI) -> None:
 async def _run_shutdown() -> None:
     """Unload models on lifespan exit."""
     logger.info("Voicebox server shutting down...")
+    from .services.task_queue import shutdown_queue
+
+    await shutdown_queue()
     try:
         tts.unload_tts_model()
     except Exception:

@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 
 from .. import models
 from ..utils.platform_detect import get_backend_type
+from ..utils.model_lifecycle import ModelResourceBusyError
 from ..services.task_queue import create_background_task
 from ..utils.progress import get_progress_manager
 from ..utils.tasks import get_task_manager
@@ -68,6 +69,8 @@ async def unload_model():
     try:
         tts.unload_tts_model()
         return {"message": "Model unloaded successfully"}
+    except ModelResourceBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -86,6 +89,8 @@ async def unload_model_by_name(model_name: str):
         if not was_loaded:
             return {"message": f"Model {model_name} is not loaded"}
         return {"message": f"Model {model_name} unloaded successfully"}
+    except ModelResourceBusyError as e:
+        raise HTTPException(status_code=409, detail=str(e)) from e
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
